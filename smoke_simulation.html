@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smoke Simulation</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #0f0b09;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+  }
+  #controls {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    background: rgba(15, 11, 9, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    padding: 14px 16px;
+    color: #e8ddd4;
+    font-size: 12px;
+    line-height: 1.5;
+    user-select: none;
+    backdrop-filter: blur(4px);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+    max-width: 260px;
+  }
+  #controls h2 {
+    margin: 0 0 8px 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: #fff;
+    letter-spacing: 0.3px;
+  }
+  #controls p {
+    margin: 0 0 12px 0;
+    opacity: 0.75;
+    font-size: 11px;
+  }
+  #controls label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+    gap: 10px;
+  }
+  #controls input[type="range"] {
+    flex: 1;
+    min-width: 90px;
+  }
+  #controls .value {
+    width: 44px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: #9ed8ff;
+  }
+</style>
+</head>
+<body>
+<div id="controls">
+  <h2>Smoke Simulation</h2>
+  <p>Left drag pushes smoke. Right-click or Shift+drag clears.</p>
+  <label>Viscosity <input id="viscSlider" type="range" min="-6" max="-2" step="0.1" value="-4"><span class="value" id="viscVal">0.0001</span></label>
+  <label>Diffusion <input id="diffSlider" type="range" min="-6" max="-2" step="0.1" value="-4"><span class="value" id="diffVal">0.0001</span></label>
+  <label>Fade rate <input id="fadeSlider" type="range" min="0.900" max="0.999" step="0.001" value="0.995"><span class="value" id="fadeVal">0.995</span></label>
+</div>
+<canvas id="canvas"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  // ---------------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------------
+  const N = 256;
+  const SIZE = N * N;
+  const DT = 0.1;
+  const PRESSURE_ITERATIONS = 20;
+  const THRESHOLD = 0.35;
+  const THRESH_LOW = THRESHOLD - 0.08;
+  const THRESH_HIGH = THRESHOLD + 0.08;
+
+  // ---------------------------------------------------------------------------
+  // Fields
+  // ---------------------------------------------------------------------------
+  const u = new Float32Array(SIZE);
+  const v = new Float32Array(SIZE);
+  const uPrev = new Float32Array(SIZE);
+  const vPrev = new Float32Array(SIZE);
+  const d = new Float32Array(SIZE);
+  const dPrev = new Float32Array(SIZE);
+  const p = new Float32Array(SIZE);
+  const div = new Float32Array(SIZE);
+  const curl = new Float32Array(SIZE);
+  const dBlur = new Float32Array(SIZE);
+  const blurTmp = new Float32Array(SIZE);
+
+  // ---------------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------------
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+
+  const simCanvas = document.createElement('canvas');
+  simCanvas.width = N;
+  simCanvas.height = N;
+  const simCtx = simCanvas.getContext('2d');
+  const imgData = simCtx.createImageData(N, N);
+  const pixels = imgData.data;
+
+  const bgCanvas = document.createElement('canvas');
+  bgCanvas.width = N;
+  bgCanvas.height = N;
+  const bgCtx = bgCanvas.getContext('2d');
+  const bgImgData = bgCtx.createImageData(N, N);
+  const bgPixels = bgImgData.data;
+
+  // ---------------------------------------------------------------------------
+  // UI state
+  // ---------------------------------------------------------------------------
+  let viscosity = 1e-4;
+  let diffusion = 1e-4;
+  let fadeRate = 0.995;
+
+  const viscSlider = document.getElementById('viscSlider');
+  const diffSlider = document.getElementById('diffSlider');
+  const fadeSlider = document.getElementById('fadeSlider');
+  const viscVal = document.getElementById('viscVal');
+  const diffVal = document.getElementById('diffVal');
+  const fadeVal = document.getElementById('fadeVal');
+
+  function updateParams() {
+    viscosity = Math.pow(10, parseFloat(viscSlider.value));
+    diffusion = Math.pow(10, parseFloat(diffSlider.value));
+    fadeRate = parseFloat(fadeSlider.value);
+    viscVal.textContent = viscosity.toExponential(1);
+    diffVal.textContent = diffusion.toExponential(1);
+    fadeVal.textContent = fadeRate.toFixed(3);
+  }
+  viscSlider.addEventListener('input', updateParams);
+  diffSlider.addEventListener('input', updateParams);
+  fadeSlider.addEventListener('input', updateParams);
+  updateParams();
+
+  // ---------------------------------------------------------------------------
+  // Mouse / touch state
+  // ---------------------------------------------------------------------------
+  let mouseX = 0, mouseY = 0;
+  let prevMouseX = 0, prevMouseY = 0;
+  let isDown = false;
+  let isErase = false;
+
+  function getGridPos(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const x = (clientX - rect.left) * N / rect.width;
+    const y = (clientY - rect.top) * N / rect.height;
+    return { x, y };
+  }
+
+  function onPointerDown(x, y, erase) {
+    isDown = true;
+    isErase = erase;
+    const pos = getGridPos(x, y);
+    mouseX = pos.x; mouseY = pos.y;
+    prevMouseX = mouseX; prevMouseY = mouseY;
+  }
+
+  function onPointerMove(x, y, shift) {
+    const pos = getGridPos(x, y);
+    mouseX = pos.x; mouseY = pos.y;
+    if (shift && isDown) isErase = true;
+  }
+
+  function onPointerUp() {
+    isDown = false;
+    isErase = false;
+  }
+
+  canvas.addEventListener('mousedown', e => {
+    e.preventDefault();
+    onPointerDown(e.clientX, e.clientY, e.button === 2 || e.shiftKey);
+  });
+  window.addEventListener('mouseup', onPointerUp);
+  canvas.addEventListener('mousemove', e => onPointerMove(e.clientX, e.clientY, e.shiftKey));
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    const t = e.touches[0];
+    onPointerDown(t.clientX, t.clientY, false);
+  }, { passive: false });
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = e.touches[0];
+    onPointerMove(t.clientX, t.clientY, false);
+  }, { passive: false });
+  canvas.addEventListener('touchend', e => {
+    e.preventDefault();
+    onPointerUp();
+  }, { passive: false });
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+  const N2 = N / 2;
+
+  function clamp(v, lo, hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+  }
+
+  function smoothstep(edge0, edge1, x) {
+    const t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
+    return t * t * (3 - 2 * t);
+  }
+
+  function lerp(a, b, t) {
+    return a + (b - a) * t;
+  }
+
+  function sampleBilinear(field, x, y) {
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+    const sx = x - x0;
+    const sy = y - y0;
+    const x0c = x0 < 0 ? 0 : (x0 >= N ? N - 1 : x0);
+    const x1c = x0c >= N - 1 ? N - 1 : x0c + 1;
+    const y0c = y0 < 0 ? 0 : (y0 >= N ? N - 1 : y0);
+    const y1c = y0c >= N - 1 ? N - 1 : y0c + 1;
+    const i00 = y0c * N + x0c;
+    const i10 = y0c * N + x1c;
+    const i01 = y1c * N + x0c;
+    const i11 = y1c * N + x1c;
+    const v0 = field[i00] * (1 - sx) + field[i10] * sx;
+    const v1 = field[i01] * (1 - sx) + field[i11] * sx;
+    return v0 * (1 - sy) + v1 * sy;
+  }
+
+  function sampleBgChannel(x, y, channel) {
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+    const sx = x - x0;
+    const sy = y - y0;
+    const x0c = x0 < 0 ? 0 : (x0 >= N ? N - 1 : x0);
+    const x1c = x0c >= N - 1 ? N - 1 : x0c + 1;
+    const y0c = y0 < 0 ? 0 : (y0 >= N ? N - 1 : y0);
+    const y1c = y0c >= N - 1 ? N - 1 : y0c + 1;
+    const i00 = (y0c * N + x0c) * 4 + channel;
+    const i10 = (y0c * N + x1c) * 4 + channel;
+    const i01 = (y1c * N + x0c) * 4 + channel;
+    const i11 = (y1c * N + x1c) * 4 + channel;
+    const v0 = bgPixels[i00] * (1 - sx) + bgPixels[i10] * sx;
+    const v1 = bgPixels[i01] * (1 - sx) + bgPixels[i11] * sx;
+    return v0 * (1 - sy) + v1 * sy;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Procedural wood texture
+  // ---------------------------------------------------------------------------
+  function generateBackground() {
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        const grain1 = Math.sin(y * 0.045 + x * 0.008) * 0.5 + 0.5;
+        const grain2 = Math.sin(y * 0.13 + x * 0.018) * 0.5 + 0.5;
+        const grain3 = Math.sin(y * 0.38 + x * 0.03) * 0.5 + 0.5;
+        const noise = Math.random();
+        const t = grain1 * 0.45 + grain2 * 0.20 + grain3 * 0.10 + noise * 0.25;
+        const r = lerp(0x1f, 0x10, t);
+        const g = lerp(0x1f, 0x10, t);
+        const b = lerp(0x22, 0x12, t);
+        const i = (y * N + x) * 4;
+        bgPixels[i] = r;
+        bgPixels[i + 1] = g;
+        bgPixels[i + 2] = b;
+        bgPixels[i + 3] = 255;
+      }
+    }
+    bgCtx.putImageData(bgImgData, 0, 0);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Initial smoke puff
+  // ---------------------------------------------------------------------------
+  function initSmoke() {
+    const cx = N * 0.5;
+    const cy = N * 0.5;
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        const dx = x - cx;
+        const dy = y - cy;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 28) {
+          d[y * N + x] = Math.max(0, 1 - dist / 28);
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Fluid solver: Stable Fluids
+  // ---------------------------------------------------------------------------
+  function advectVelocity() {
+    for (let y = 1; y < N - 1; y++) {
+      for (let x = 1; x < N - 1; x++) {
+        const i = y * N + x;
+        const px = x + 0.5 - uPrev[i] * DT;
+        const py = y + 0.5 - vPrev[i] * DT;
+        u[i] = sampleBilinear(uPrev, px, py);
+        v[i] = sampleBilinear(vPrev, px, py);
+      }
+    }
+    // Zero-slip walls
+    for (let x = 0; x < N; x++) {
+      u[x] = 0; v[x] = 0;
+      u[(N - 1) * N + x] = 0; v[(N - 1) * N + x] = 0;
+    }
+    for (let y = 0; y < N; y++) {
+      u[y * N] = 0; v[y * N] = 0;
+      u[y * N + N - 1] = 0; v[y * N + N - 1] = 0;
+    }
+  }
+
+  function advectDensity() {
+    for (let y = 1; y < N - 1; y++) {
+      for (let x = 1; x < N - 1; x++) {
+        const i = y * N + x;
+        const px = x + 0.5 - u[i] * DT;
+        const py = y + 0.5 - v[i] * DT;
+        d[i] = sampleBilinear(dPrev, px, py);
+      }
+    }
+    // Slightly damped / bouncing boundaries
+    for (let x = 0; x < N; x++) {
+      d[x] = d[N + x] * 0.78;
+      d[(N - 1) * N + x] = d[(N - 2) * N + x] * 0.78;
+    }
+    for (let y = 0; y < N; y++) {
+      d[y * N] = d[y * N + 1] * 0.78;
+      d[y * N + N - 1] = d[y * N + N - 2] * 0.78;
+    }
+  }
+
+  function diffuseVelocity() {
+    const a = viscosity * DT;
+    if (a <= 0) return;
+    for (let y = 1; y < N - 1; y++) {
+      for (let x = 1; x < N - 1; x++) {
+        const i = y * N + x;
+        u[i] += a * (u[i - 1] + u[i + 1] + u[i - N] + u[i + N] - 4 * u[i]);
+        v[i] += a * (v[i - 1] + v[i + 1] + v[i - N] + v[i + N] - 4 * v[i]);
+      }
+    }
+  }
+
+  function diffuseDensity() {
+    const a = diffusion * DT;
+    if (a <= 0) return;
+    for (let y = 1; y < N - 1; y++) {
+      for (let x = 1; x < N - 1; x++) {
+        const i = y * N + x;
+        d[i] += a * (d[i - 1] + d[i + 1] + d[i - N] + d[i + N] - 4 * d[i]);
+      }
+    }
+  }
+
+  function projectVelocity() {
+    // Compute divergence
+    for (let y = 1; y < N - 1; y++) {
+      for (let x = 1; x < N - 1; x++) {
+        const i = y * N + x;
+        div[i] = 0.5 * (u[i + 1] - u[i - 1] + v[i + N] - v[i - N]);
+        p[i] = 0;
+      }
+    }
+    for (let x = 0; x < N; x++) {
+      div[x] = 0; div[(N - 1) * N + x] = 0;
+      p[x] = 0; p[(N - 1) * N + x] = 0;
+    }
+    for (let y = 0; y < N; y++) {
+      div[y * N] = 0; div[y * N + N - 1] = 0;
+      p[y * N] = 0; p[y * N + N - 1] = 0;
+    }
+
+    // Jacobi iterations
+    for (let k = 0; k < PRESSURE_ITERATIONS; k++) {
+      for (let y = 1; y < N - 1; y++) {
+        for (let x = 1; x < N - 1; x++) {
+          const i = y * N + x;
+          p[i] = (p[i - 1] + p[i + 1] + p[i - N] + p[i + N] - div[i]) * 0.25;
+        }
+      }
+      // Neumann pressure boundaries
+      for (let x = 0; x < N; x++) {
+        p[x] = p[N + x];
+        p[(N - 1) * N + x] = p[(N - 2) * N + x];
+      }
+      for (let y = 0; y < N; y++) {
+        p[y * N] = p[y * N + 1];
+        p[y * N + N - 1] = p[y * N + N - 2];
+      }
+    }
+
+    // Subtract pressure gradient
+    for (let y = 1; y < N - 1; y++) {
+      for (let x = 1; x < N - 1; x++) {
+        const i = y * N + x;
+        u[i] -= 0.5 * (p[i + 1] - p[i - 1]);
+        v[i] -= 0.5 * (p[i + N] - p[i - N]);
+      }
+    }
+    // Re-apply zero-slip walls
+    for (let x = 0; x < N; x++) {
+      u[x] = 0; v[x] = 0;
+      u[(N - 1) * N + x] = 0; v[(N - 1) * N + x] = 0;
+    }
+    for (let y = 0; y < N; y++) {
+      u[y * N] = 0; v[y * N] = 0;
+      u[y * N + N - 1] = 0; v[y * N + N - 1] = 0;
+    }
+  }
+
+  function applyVorticityConfinement() {
+    const conf = 0.2;
+    const eps = 1e-5;
+
+    for (let y = 1; y < N - 1; y++) {
+      for (let x = 1; x < N - 1; x++) {
+        const i = y * N + x;
+        curl[i] = 0.5 * (v[i + 1] - v[i - 1] - u[i + N] + u[i - N]);
+      }
+    }
+
+    for (let y = 1; y < N - 1; y++) {
+      for (let x = 1; x < N - 1; x++) {
+        const i = y * N + x;
+        const cx = 0.5 * (Math.abs(curl[i + 1]) - Math.abs(curl[i - 1]));
+        const cy = 0.5 * (Math.abs(curl[i + N]) - Math.abs(curl[i - N]));
+        const len = Math.sqrt(cx * cx + cy * cy) + eps;
+        const nx = cx / len;
+        const ny = cy / len;
+        u[i] += DT * conf * (ny * curl[i]);
+        v[i] += DT * conf * (-nx * curl[i]);
+      }
+    }
+  }
+
+  function injectInput() {
+    if (!isDown) return;
+    const dx = mouseX - prevMouseX;
+    const dy = mouseY - prevMouseY;
+    const radius = 15;
+    const radiusSq = radius * radius;
+    const x0 = Math.max(1, Math.floor(mouseX - radius));
+    const x1 = Math.min(N - 2, Math.ceil(mouseX + radius));
+    const y0 = Math.max(1, Math.floor(mouseY - radius));
+    const y1 = Math.min(N - 2, Math.ceil(mouseY + radius));
+
+    if (isErase) {
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+          const ox = x - mouseX;
+          const oy = y - mouseY;
+          const distSq = ox * ox + oy * oy;
+          if (distSq > radiusSq) continue;
+          const falloff = 1 - distSq / radiusSq;
+          const w = falloff * falloff;
+          d[y * N + x] -= 0.8 * w;
+        }
+      }
+    } else {
+      const velScale = 4.0;
+      const vx = clamp(dx * velScale, -25, 25);
+      const vy = clamp(dy * velScale, -25, 25);
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+          const ox = x - mouseX;
+          const oy = y - mouseY;
+          const distSq = ox * ox + oy * oy;
+          if (distSq > radiusSq) continue;
+          const falloff = 1 - distSq / radiusSq;
+          const w = falloff * falloff;
+          const i = y * N + x;
+          u[i] += vx * w;
+          v[i] += vy * w;
+          d[i] += 0.5 * w;
+        }
+      }
+    }
+  }
+
+  function clampFields() {
+    for (let i = 0; i < SIZE; i++) {
+      d[i] = clamp(d[i], 0, 1);
+      u[i] = clamp(u[i], -25, 25);
+      v[i] = clamp(v[i], -25, 25);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 3-pass separable box blur (simulates surface tension + smooth edges)
+  // ---------------------------------------------------------------------------
+  function boxBlur3(src, dst, tmp, radius, passes) {
+    dst.set(src);
+    const denom = 1 / (2 * radius + 1);
+    for (let pass = 0; pass < passes; pass++) {
+      // horizontal: dst -> tmp
+      for (let y = 0; y < N; y++) {
+        const row = y * N;
+        let sum = 0;
+        for (let x = -radius; x <= radius; x++) {
+          const xi = x < 0 ? 0 : (x >= N ? N - 1 : x);
+          sum += dst[row + xi];
+        }
+        for (let x = 0; x < N; x++) {
+          tmp[row + x] = sum * denom;
+          const xLeft = x - radius;
+          const xRight = x + radius + 1;
+          const xl = xLeft < 0 ? 0 : xLeft;
+          const xr = xRight >= N ? N - 1 : xRight;
+          sum += dst[row + xr] - dst[row + xl];
+        }
+      }
+      // vertical: tmp -> dst
+      for (let x = 0; x < N; x++) {
+        let sum = 0;
+        for (let y = -radius; y <= radius; y++) {
+          const yi = y < 0 ? 0 : (y >= N ? N - 1 : y);
+          sum += tmp[yi * N + x];
+        }
+        for (let y = 0; y < N; y++) {
+          dst[y * N + x] = sum * denom;
+          const yTop = y - radius;
+          const yBottom = y + radius + 1;
+          const yt = yTop < 0 ? 0 : yTop;
+          const yb = yBottom >= N ? N - 1 : yBottom;
+          sum += tmp[yb * N + x] - tmp[yt * N + x];
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rendering
+  // ---------------------------------------------------------------------------
+  const DEEP = [0x22, 0x22, 0x22];
+  const MID = [0x66, 0x66, 0x66];
+  const SHALLOW = [0xaa, 0xaa, 0xaa];
+  const EDGE = [0xee, 0xee, 0xee];
+
+  const lightX = -0.7, lightY = -0.7, lightZ = 0.7;
+  const hLen = Math.sqrt(lightX * lightX + lightY * lightY + (lightZ + 1) * (lightZ + 1));
+  const hx = lightX / hLen;
+  const hy = lightY / hLen;
+  const hz = (lightZ + 1) / hLen;
+
+  function smokeColor(db) {
+    const depth = clamp((db - THRESHOLD) / (1 - THRESHOLD), 0, 1);
+    if (depth < 0.33) {
+      const t = smoothstep(0, 0.33, depth);
+      return [
+        lerp(EDGE[0], SHALLOW[0], t),
+        lerp(EDGE[1], SHALLOW[1], t),
+        lerp(EDGE[2], SHALLOW[2], t)
+      ];
+    } else if (depth < 0.66) {
+      const t = smoothstep(0.33, 0.66, depth);
+      return [
+        lerp(SHALLOW[0], MID[0], t),
+        lerp(SHALLOW[1], MID[1], t),
+        lerp(SHALLOW[2], MID[2], t)
+      ];
+    } else {
+      const t = smoothstep(0.66, 1, depth);
+      return [
+        lerp(MID[0], DEEP[0], t),
+        lerp(MID[1], DEEP[1], t),
+        lerp(MID[2], DEEP[2], t)
+      ];
+    }
+  }
+
+  let time = 0;
+
+  function renderFrame() {
+    const refractScale = 0.12;
+
+    // Edges: copy wood background
+    for (let x = 0; x < N; x++) {
+      for (let y of [0, N - 1]) {
+        const i = (y * N + x) * 4;
+        pixels[i] = bgPixels[i];
+        pixels[i + 1] = bgPixels[i + 1];
+        pixels[i + 2] = bgPixels[i + 2];
+        pixels[i + 3] = 255;
+      }
+    }
+    for (let y = 1; y < N - 1; y++) {
+      for (let x of [0, N - 1]) {
+        const i = (y * N + x) * 4;
+        pixels[i] = bgPixels[i];
+        pixels[i + 1] = bgPixels[i + 1];
+        pixels[i + 2] = bgPixels[i + 2];
+        pixels[i + 3] = 255;
+      }
+    }
+
+    for (let y = 1; y < N - 1; y++) {
+      for (let x = 1; x < N - 1; x++) {
+        const i = y * N + x;
+        const pi = i * 4;
+        const db = dBlur[i];
+
+        // Vignette
+        const vx = (x - N2) / N2;
+        const vy = (y - N2) / N2;
+        let vig = 1 - 0.28 * (vx * vx + vy * vy);
+        if (vig < 0) vig = 0;
+
+        if (db > THRESH_LOW) {
+          const mask = smoothstep(THRESH_LOW, THRESH_HIGH, db);
+          const uu = u[i];
+          const vv = v[i];
+
+          // Subtle refraction / heat-distortion offsets
+          const ox = uu * refractScale;
+          const oy = vv * refractScale;
+          const rBg = sampleBgChannel(x + ox * 1.05, y + oy * 1.05, 0);
+          const gBg = sampleBgChannel(x + ox, y + oy, 1);
+          const bBg = sampleBgChannel(x + ox * 0.95, y + oy * 0.95, 2);
+
+          // Depth-based smoke tint
+          const wc = smokeColor(db);
+          const depth = smoothstep(THRESHOLD, 1.0, db);
+          const alpha = (0.18 + 0.55 * depth) * mask;
+
+          let R = rBg * (1 - alpha) + wc[0] * alpha;
+          let G = gBg * (1 - alpha) + wc[1] * alpha;
+          let B = bBg * (1 - alpha) + wc[2] * alpha;
+
+          // Soft specular sheen from density-gradient normals
+          const gx = (dBlur[i + 1] - dBlur[i - 1]) * 0.5;
+          const gy = (dBlur[i + N] - dBlur[i - N]) * 0.5;
+          const gLen = Math.sqrt(gx * gx + gy * gy + 1);
+          const nx = -gx / gLen;
+          const ny = -gy / gLen;
+          const nz = 1 / gLen;
+          const spec = Math.pow(Math.max(0, nx * hx + ny * hy + nz * hz), 48);
+          R += spec * 64;
+          G += spec * 64;
+          B += spec * 64;
+
+          R *= vig; G *= vig; B *= vig;
+          pixels[pi] = clamp(R, 0, 255);
+          pixels[pi + 1] = clamp(G, 0, 255);
+          pixels[pi + 2] = clamp(B, 0, 255);
+          pixels[pi + 3] = 255;
+        } else {
+          // Contact shadow / AO near water edge
+          const edgeDist = THRESHOLD - db;
+          const shadow = smoothstep(0.22, 0, edgeDist);
+          const s = 1 - shadow * 0.45;
+          const r = bgPixels[pi] * s * vig;
+          const g = bgPixels[pi + 1] * s * vig;
+          const b = bgPixels[pi + 2] * s * vig;
+          pixels[pi] = r;
+          pixels[pi + 1] = g;
+          pixels[pi + 2] = b;
+          pixels[pi + 3] = 255;
+        }
+      }
+    }
+
+    simCtx.putImageData(imgData, 0, 0);
+    ctx.drawImage(simCanvas, 0, 0, canvas.width, canvas.height);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Resize
+  // ---------------------------------------------------------------------------
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.floor(window.innerWidth * dpr);
+    canvas.height = Math.floor(window.innerHeight * dpr);
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
+  }
+  window.addEventListener('resize', resize);
+
+  // ---------------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------------
+  function step() {
+    time += 0.016;
+
+    injectInput();
+    prevMouseX = mouseX;
+    prevMouseY = mouseY;
+
+    uPrev.set(u);
+    vPrev.set(v);
+    dPrev.set(d);
+
+    // 1. Advect velocity through itself (semi-Lagrangian)
+    advectVelocity();
+
+    // 2. Advect density through the velocity field
+    advectDensity();
+
+    // 3. Apply velocity diffusion (viscosity)
+    diffuseVelocity();
+
+    // 3b. Apply density diffusion
+    diffuseDensity();
+
+    // 4. Pressure projection (enforce incompressibility)
+    projectVelocity();
+
+    // 5. Vorticity confinement (preserve eddies)
+    applyVorticityConfinement();
+
+    // Fade density
+    for (let i = 0; i < SIZE; i++) {
+      d[i] *= fadeRate;
+    }
+
+    clampFields();
+
+    // Surface reconstruction: blur density, threshold, render
+    boxBlur3(d, dBlur, blurTmp, 2, 3);
+    renderFrame();
+
+    requestAnimationFrame(step);
+  }
+
+  generateBackground();
+  initSmoke();
+  resize();
+  requestAnimationFrame(step);
+})();
+</script>
+</body>
+</html>
